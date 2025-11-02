@@ -1,0 +1,185 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <LiquidCrystal_I2C.h>
+
+// WiFi credentials
+const char* ssid = "YOUR_WIFI_SSID"; //Insert WiFi Name
+const char* password = "YOUR_WIFI_PASSWORD"; //Insert WiFi Password
+
+// Full Google Apps Script Web App URL
+const char* scriptUrl = "https://script.google.com/macros/s/your-script-id/exec"; // Google Apps Script URL
+
+// Secure client
+WiFiClientSecure client;
+
+// I2C LCD configuration
+const int lcdColumns = 16;
+const int lcdRows = 2;
+const int lcdAddress = 0x27; // Your LCD's I2C address, may be different
+LiquidCrystal_I2C lcd(lcdAddress, lcdColumns, lcdRows);
+
+// Potentiometer pin
+const int POT_PIN = 34; // Use an analog-capable pin like GPIO 34
+
+// Time since last update (TSLU) variables
+unsigned long lastUpdateTime = 0;
+unsigned long timeSinceUpdate = 0;
+
+// Stock data variables
+const int MAX_STOCKS = 10;
+String stockSymbols[MAX_STOCKS];
+float stockPrices[MAX_STOCKS];
+float stockChanges[MAX_STOCKS];
+int stockCount = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting to");
+  lcd.setCursor(0, 1);
+  lcd.print(ssid);
+
+  // Connect to Wi-Fi
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("WiFi Connected!");
+  delay(2000);
+
+  // Set up time for HTTPS
+  client.setInsecure();
+  configTime(0, 0, "pool.ntp.org");
+
+  // Initial data fetch
+  fetchStockData();
+}
+
+void loop() {
+  // Read potentiometer value
+  int potValue = analogRead(POT_PIN);
+  int stockIndex = map(potValue, 0, 4095, 0, stockCount - 1);
+  if (stockIndex < 0) stockIndex = 0; // Prevent negative index
+  if (stockIndex >= stockCount) stockIndex = stockCount - 1; // Prevent out of bounds
+
+  // Update TSLU
+  timeSinceUpdate = (millis() - lastUpdateTime) / 1000;
+
+  // Display stock data on LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(stockSymbols[stockIndex]);
+  lcd.setCursor(0, 1);
+  lcd.print(stockPrices[stockIndex], 2);
+  lcd.print(" ");
+  lcd.print(stockChanges[stockIndex], 2);
+  lcd.print("%");
+
+  // Display TSLU on the top right
+  lcd.setCursor(lcdColumns - 4, 0); // Adjust to make sure the text fits
+  if (timeSinceUpdate < 60) {
+    lcd.print(timeSinceUpdate);
+    lcd.print("s");
+  } else {
+    lcd.print(timeSinceUpdate / 60);
+    lcd.print("m");
+  }
+
+  // Fetch new data every 5 minutes (300000 milliseconds)
+  if (millis() - lastUpdateTime > 300000) {
+    fetchStockData();
+  }
+
+  delay(200); // Small delay to prevent display flicker and rapid reading
+}
+
+void fetchStockData() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String(scriptUrl);
+
+    Serial.println("---");
+    Serial.print("Sending GET request to: ");
+    Serial.println(url);
+
+    http.begin(client, url);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+      Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+
+      if (httpCode == HTTP_CODE_OK) {
+        DynamicJsonDocument doc(2048); // Increased size to handle more data
+        DeserializationError error = deserializeJson(doc, http.getString());
+
+        if (error) {
+          Serial.print(F("deserializeJson() failed: "));
+          Serial.println(error.f_str());
+          lcd.clear();
+          lcd.print("JSON Error!");
+          delay(2000);
+        } else {
+          JsonArray stocks = doc.as<JsonArray>();
+          stockCount = 0;
+
+          // Clear old data
+          for (int i = 0; i < MAX_STOCKS; i++) {
+            stockSymbols[i] = "";
+          }
+
+          // Iterate through the list of stock objects and store in arrays
+          for (JsonObject stock : stocks) {
+            if (stockCount < MAX_STOCKS) {
+              stockSymbols[stockCount] = stock["Stock"].as<String>();
+              stockPrices[stockCount] = stock["Price"].as<float>();
+              stockChanges[stockCount] = stock["Change (%)"].as<float>();
+              stockCount++;
+            }
+          }
+          lastUpdateTime = millis(); // Update the timer
+          Serial.println("Stock data updated.");
+        }
+      } else {
+        Serial.println("Unexpected response:");
+        Serial.println(http.getString());
+        lcd.clear();
+        lcd.print("HTTP Error: ");
+        lcd.print(httpCode);
+        delay(2000);
+      }
+    } else {
+      Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+      lcd.clear();
+      lcd.print("GET Failed!");
+      delay(2000);
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected. Retrying...");
+    lcd.clear();
+    lcd.print("WiFi Down");
+    delay(2000);
+  }
+}
